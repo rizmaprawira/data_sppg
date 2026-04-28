@@ -11,6 +11,8 @@ rizmaprawira17@gmail.com
 
 - `download_sppg.py`: Scrapes all available pages from the BGN operational SPPG listing and exports the result to CSV and XLSX.
 - `sppg50.py`: Scrapes the first 5 pages and exports the result to CSV.
+- `geocode_sppg_osm.py`: Core geocoder that adds `latitude` and `longitude` to `bgn_sppg_operasional.xlsx` using the local OSM extracts.
+- `geocode_sppg_osm_sumatra.py`, `geocode_sppg_osm_java.py`, `geocode_sppg_osm_kalimantan.py`, `geocode_sppg_osm_sulawesi.py`, `geocode_sppg_osm_nusa_tenggara.py`, `geocode_sppg_osm_maluku.py`, `geocode_sppg_osm_papua.py`: Island-specific entrypoints that can be run independently or in parallel.
 
 ## Requirements
 
@@ -19,6 +21,7 @@ rizmaprawira17@gmail.com
 - `pandas`
 - `beautifulsoup4`
 - `openpyxl` for writing Excel files
+- For geocoding: `geopandas`, `shapely`, `pyrosm`, `pyogrio`
 
 ## Usage
 
@@ -40,10 +43,33 @@ Run the first-5-pages scraper:
 python sppg50.py
 ```
 
+Geocode the operational workbook from the local OSM extracts:
+
+```bash
+conda run -n osm python geocode_sppg_osm.py
+```
+
+To run one island at a time, use the island wrapper scripts, for example:
+
+```bash
+conda run -n osm python geocode_sppg_osm_sumatra.py
+conda run -n osm python geocode_sppg_osm_java.py
+```
+
+Each island script writes its own workbook, such as `bgn_sppg_operasional_geocoded_sumatra.xlsx`, and adds an `unresolved_rows` review sheet for rows that could not be matched conservatively.
+
 ## Output Files
 
 - `bgn_sppg_operasional.csv`
 - `bgn_sppg_operasional.xlsx`
+- `bgn_sppg_operasional_geocoded.xlsx`
+- `bgn_sppg_operasional_geocoded_sumatra.xlsx`
+- `bgn_sppg_operasional_geocoded_java.xlsx`
+- `bgn_sppg_operasional_geocoded_kalimantan.xlsx`
+- `bgn_sppg_operasional_geocoded_sulawesi.xlsx`
+- `bgn_sppg_operasional_geocoded_nusa_tenggara.xlsx`
+- `bgn_sppg_operasional_geocoded_maluku.xlsx`
+- `bgn_sppg_operasional_geocoded_papua.xlsx`
 - `bgn_sppg_first_5_pages.csv`
 
 ## Notes
