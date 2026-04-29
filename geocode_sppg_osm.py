@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import gzip
 import pickle
 import re
@@ -17,6 +18,7 @@ import geopandas as gpd
 import pandas as pd
 from openpyxl import Workbook, load_workbook
 from pyrosm import OSM
+from shapely.geometry import box
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 from shapely.prepared import prep
@@ -25,6 +27,9 @@ from shapely.prepared import prep
 SOURCE_WORKBOOK = Path("bgn_sppg_operasional.xlsx")
 DEFAULT_OUTPUT_WORKBOOK = Path("bgn_sppg_operasional_geocoded.xlsx")
 DEFAULT_CACHE_DIR = Path("/private/tmp/sppg_osm_cache")
+JAVA_ADMIN_BOUNDARY_PATH = Path(
+    "/Users/rizzie/Work/IndonesiaRe/data/batas_keldesa/Batas_Wilayah_KelurahanDesa_10K_AR.shp"
+)
 NETWORK_TYPE = "driving+service"
 
 INPUT_COLUMNS = [
@@ -214,6 +219,16 @@ class PreparedExtract:
     token_index: dict[str, set[str]]
 
 
+@dataclass
+class JavaAdminCatalog:
+    province_bounds: dict[str, tuple[float, float, float, float]]
+    kabkota_bounds: dict[tuple[str, str], tuple[float, float, float, float]]
+    kecamatan_bounds: dict[tuple[str, str, str], tuple[float, float, float, float]]
+    province_names: dict[str, str]
+    kabkota_names: dict[tuple[str, str], str]
+    kecamatan_names: dict[tuple[str, str, str], str]
+
+
 def normalize_text(value: object) -> str:
     if value is None:
         return ""
@@ -264,6 +279,34 @@ def normalize_admin_name(value: object) -> str:
     text = re.sub(r"\bDS\b", " ", text)
     text = re.sub(r"\bDSN\b", " ", text)
     text = collapse_spaces(text)
+    return text
+
+
+def normalize_kabkota_name(value: object) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+    text = collapse_spaced_letters(text)
+    text = re.sub(r"\bDAERAH ISTIMEWA\b", " ", text)
+    text = re.sub(r"\bDAERAH KHUSUS IBUKOTA\b", " ", text)
+    text = re.sub(r"\bPROVINSI\b", " ", text)
+    text = re.sub(r"\bKABUPATEN\b", " ", text)
+    text = re.sub(r"\bKAB\b", " ", text)
+    text = re.sub(r"\bKOTA ADMINISTRASI\b", " ", text)
+    text = re.sub(r"\bKOTA ADM\b", " ", text)
+    text = re.sub(r"\bKOTA\b", " ", text)
+    text = re.sub(r"\bADM\b", " ", text)
+    text = re.sub(r"\bADMINISTRASI\b", " ", text)
+    text = re.sub(r"\bKECAMATAN\b", " ", text)
+    text = re.sub(r"\bKEC\b", " ", text)
+    text = re.sub(r"\bKELURAHAN\b", " ", text)
+    text = re.sub(r"\bKEL\b", " ", text)
+    text = re.sub(r"\bDESA\b", " ", text)
+    text = re.sub(r"\bDS\b", " ", text)
+    text = re.sub(r"\bDSN\b", " ", text)
+    text = collapse_spaces(text)
+    if text in {"KEP SERIBU", "KEPULAUAN SERIBU", "SERIBU"}:
+        return "KEPULAUAN SERIBU"
     return text
 
 
@@ -473,6 +516,71 @@ def province_group_lookup() -> dict[str, str]:
     return lookup
 
 
+@lru_cache(maxsize=1)
+def java_province_lookup() -> set[str]:
+    return {normalize_admin_name(province) for province in PROVINCE_GROUPS["java"]}
+
+
+def _union_geometries(geometries: Iterable[BaseGeometry]) -> BaseGeometry | None:
+    values = [geometry for geometry in geometries if geometry is not None and not geometry.is_empty]
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    merged = unary_union(values)
+    if merged.is_empty:
+        return None
+    return merged
+
+
+@lru_cache(maxsize=1)
+def build_java_admin_catalog() -> JavaAdminCatalog:
+    boundaries = gpd.read_file(
+        JAVA_ADMIN_BOUNDARY_PATH,
+        columns=["WADMPR", "WADMKK", "WADMKC", "WADMKD", "geometry"],
+    )
+    boundaries = boundaries[boundaries.geometry.notna()].copy()
+    boundaries["province_key"] = boundaries["WADMPR"].map(normalize_admin_name)
+    boundaries["kabkota_key"] = boundaries["WADMKK"].map(normalize_kabkota_name)
+    boundaries["kecamatan_key"] = boundaries["WADMKC"].map(normalize_admin_name)
+    boundaries = boundaries[boundaries["province_key"].isin(java_province_lookup())].copy()
+    boundaries = boundaries[
+        boundaries["province_key"].ne("")
+        & boundaries["kabkota_key"].ne("")
+        & boundaries["kecamatan_key"].ne("")
+    ].copy()
+
+    province_bounds: dict[str, tuple[float, float, float, float]] = {}
+    province_names: dict[str, str] = {}
+    for key, group in boundaries.groupby("province_key", sort=False):
+        bounds = tuple(float(value) for value in group.geometry.total_bounds)
+        province_bounds[key] = bounds
+        province_names[key] = str(group.iloc[0]["WADMPR"])
+
+    kabkota_bounds: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+    kabkota_names: dict[tuple[str, str], str] = {}
+    for key, group in boundaries.groupby(["province_key", "kabkota_key"], sort=False):
+        bounds = tuple(float(value) for value in group.geometry.total_bounds)
+        kabkota_bounds[key] = bounds
+        kabkota_names[key] = str(group.iloc[0]["WADMKK"])
+
+    kecamatan_bounds: dict[tuple[str, str, str], tuple[float, float, float, float]] = {}
+    kecamatan_names: dict[tuple[str, str, str], str] = {}
+    for key, group in boundaries.groupby(["province_key", "kabkota_key", "kecamatan_key"], sort=False):
+        bounds = tuple(float(value) for value in group.geometry.total_bounds)
+        kecamatan_bounds[key] = bounds
+        kecamatan_names[key] = str(group.iloc[0]["WADMKC"])
+
+    return JavaAdminCatalog(
+        province_bounds=province_bounds,
+        kabkota_bounds=kabkota_bounds,
+        kecamatan_bounds=kecamatan_bounds,
+        province_names=province_names,
+        kabkota_names=kabkota_names,
+        kecamatan_names=kecamatan_names,
+    )
+
+
 def determine_extract_group(province: object) -> str:
     province_norm = normalize_admin_name(province)
     return province_group_lookup().get(province_norm, "sumatra")
@@ -482,36 +590,36 @@ def extract_group_for_province(province: object) -> str:
     return determine_extract_group(province)
 
 
-def load_or_build_extract(pbf_path: Path, cache_dir: Path, rebuild: bool = False) -> PreparedExtract:
-    cache_path = cache_path_for_extract(cache_dir, pbf_path.stem)
-    if cache_path.exists() and not rebuild:
-        return read_cache(cache_path)
-
-    print(f"[extract] building {pbf_path.name}")
-    osm = OSM(str(pbf_path))
-
-    boundaries = osm.get_boundaries(boundary_type="administrative", extra_attributes=["admin_level"])
-    if not isinstance(boundaries, gpd.GeoDataFrame):
-        boundaries = gpd.GeoDataFrame(boundaries)
-    boundaries = boundaries[boundaries.geometry.notna()].copy()
-    boundaries = boundaries[boundaries.geometry.geom_type.isin({"Polygon", "MultiPolygon"})].copy()
-    boundaries = boundaries[boundaries["name"].notna()].copy()
-    boundaries["admin_level_int"] = boundaries["admin_level"].map(parse_admin_level)
-    boundaries["name_raw"] = boundaries["name"].astype(str)
-    boundaries["name_norm"] = boundaries["name_raw"].map(normalize_admin_name)
-    boundaries["kind"] = boundaries["name_raw"].map(detect_admin_kind)
-    boundaries = boundaries[boundaries["admin_level_int"].isin({4, 5, 6, 7, 8, 9})].copy()
-    boundaries = boundaries[boundaries["name_norm"].ne("")].copy()
-    boundaries = boundaries.reset_index(drop=True)
+def build_extract(
+    pbf_path: Path,
+    bounding_box: list[float] | None = None,
+    include_boundaries: bool = True,
+) -> PreparedExtract:
+    osm = OSM(str(pbf_path), bounding_box=bounding_box)
 
     boundary_tables: dict[int, gpd.GeoDataFrame] = {}
-    for level in sorted({4, 5, 6, 7, 8, 9}):
-        table = boundaries.loc[
-            boundaries["admin_level_int"] == level,
-            ["name_raw", "name_norm", "kind", "admin_level_int", "geometry"],
-        ].copy()
-        table = table.reset_index(drop=True)
-        boundary_tables[level] = table
+    if include_boundaries:
+        boundaries = osm.get_boundaries(boundary_type="administrative", extra_attributes=["admin_level"])
+        if not isinstance(boundaries, gpd.GeoDataFrame):
+            boundaries = gpd.GeoDataFrame(boundaries)
+        boundaries = boundaries[boundaries.geometry.notna()].copy()
+        boundaries = boundaries[boundaries.geometry.geom_type.isin({"Polygon", "MultiPolygon"})].copy()
+        boundaries = boundaries[boundaries["name"].notna()].copy()
+        boundaries["admin_level_int"] = boundaries["admin_level"].map(parse_admin_level)
+        boundaries["name_raw"] = boundaries["name"].astype(str)
+        boundaries["name_norm"] = boundaries["name_raw"].map(normalize_admin_name)
+        boundaries["kind"] = boundaries["name_raw"].map(detect_admin_kind)
+        boundaries = boundaries[boundaries["admin_level_int"].isin({4, 5, 6, 7, 8, 9})].copy()
+        boundaries = boundaries[boundaries["name_norm"].ne("")].copy()
+        boundaries = boundaries.reset_index(drop=True)
+
+        for level in sorted({4, 5, 6, 7, 8, 9}):
+            table = boundaries.loc[
+                boundaries["admin_level_int"] == level,
+                ["name_raw", "name_norm", "kind", "admin_level_int", "geometry"],
+            ].copy()
+            table = table.reset_index(drop=True)
+            boundary_tables[level] = table
 
     roads = osm.get_network(network_type=NETWORK_TYPE, nodes=False)
     if not isinstance(roads, gpd.GeoDataFrame):
@@ -526,13 +634,31 @@ def load_or_build_extract(pbf_path: Path, cache_dir: Path, rebuild: bool = False
 
     road_geoms, road_tokens, token_index = build_road_index(roads)
 
-    payload = PreparedExtract(
+    return PreparedExtract(
         stem=pbf_path.stem,
         boundaries=boundary_tables,
         road_geoms=road_geoms,
         road_tokens=road_tokens,
         token_index=token_index,
     )
+
+
+def load_or_build_extract(
+    pbf_path: Path,
+    cache_dir: Path,
+    rebuild: bool = False,
+    bounding_box: list[float] | None = None,
+    include_boundaries: bool = True,
+) -> PreparedExtract:
+    if bounding_box is not None:
+        return build_extract(pbf_path, bounding_box=bounding_box, include_boundaries=include_boundaries)
+
+    cache_path = cache_path_for_extract(cache_dir, pbf_path.stem)
+    if cache_path.exists() and not rebuild:
+        return read_cache(cache_path)
+
+    print(f"[extract] building {pbf_path.name}")
+    payload = build_extract(pbf_path, include_boundaries=include_boundaries)
     write_cache(cache_path, payload)
     return payload
 
@@ -700,26 +826,42 @@ def boundary_search_order() -> list[int]:
     return [4, 5, 6, 7, 8, 9]
 
 
-def resolve_admin_paths(extract: PreparedExtract, row: pd.Series) -> list[AdminPathResult]:
+def resolve_admin_paths(
+    extract: PreparedExtract,
+    row: pd.Series | dict[str, object],
+    city_boundary: BaseGeometry | None = None,
+) -> list[AdminPathResult]:
     province_table = extract.boundaries.get(4, gpd.GeoDataFrame())
     kab_table = extract.boundaries.get(5, gpd.GeoDataFrame())
     kec_table = extract.boundaries.get(6, gpd.GeoDataFrame())
     kel_tables = [extract.boundaries.get(level, gpd.GeoDataFrame()) for level in (7, 8, 9)]
 
-    province_candidates = admin_candidates(province_table, row["Provinsi SPPG"])
-    if not province_candidates:
-        return []
-
     results: list[AdminPathResult] = []
-    for province in province_candidates:
-        kab_candidates = admin_candidates(kab_table, row["Kab./Kota SPPG"], province.geometry)
+    if city_boundary is not None:
+        province = BoundaryCandidate(
+            level=4,
+            source_index=-1,
+            name_raw=str(row["Provinsi SPPG"]),
+            name_norm=normalize_admin_name(row["Provinsi SPPG"]),
+            geometry=city_boundary,
+            score=1.0,
+        )
+        kabkota = BoundaryCandidate(
+            level=5,
+            source_index=-1,
+            name_raw=str(row["Kab./Kota SPPG"]),
+            name_norm=normalize_kabkota_name(row["Kab./Kota SPPG"]),
+            geometry=city_boundary,
+            score=1.0,
+        )
+        kab_candidates = admin_candidates(kab_table, row["Kab./Kota SPPG"], city_boundary)
         if not kab_candidates:
-            continue
+            kab_candidates = [kabkota]
 
-        for kabkota in kab_candidates:
-            kec_candidates = admin_candidates(kec_table, row["Kecamatan SPPG"], kabkota.geometry)
+        for kab_candidate in kab_candidates:
+            kec_candidates = admin_candidates(kec_table, row["Kecamatan SPPG"], kab_candidate.geometry)
             if not kec_candidates:
-                results.append(AdminPathResult(province=province, kabkota=kabkota))
+                results.append(AdminPathResult(province=province, kabkota=kab_candidate))
                 continue
 
             for kecamatan in kec_candidates:
@@ -732,7 +874,7 @@ def resolve_admin_paths(extract: PreparedExtract, row: pd.Series) -> list[AdminP
                         results.append(
                             AdminPathResult(
                                 province=province,
-                                kabkota=kabkota,
+                                kabkota=kab_candidate,
                                 kecamatan=kecamatan,
                                 kelurahan=kelurahan,
                             )
@@ -741,10 +883,49 @@ def resolve_admin_paths(extract: PreparedExtract, row: pd.Series) -> list[AdminP
                     results.append(
                         AdminPathResult(
                             province=province,
-                            kabkota=kabkota,
+                            kabkota=kab_candidate,
                             kecamatan=kecamatan,
                         )
                     )
+    else:
+        province_candidates = admin_candidates(province_table, row["Provinsi SPPG"])
+        if not province_candidates:
+            return []
+
+        for province in province_candidates:
+            kab_candidates = admin_candidates(kab_table, row["Kab./Kota SPPG"], province.geometry)
+            if not kab_candidates:
+                continue
+
+            for kabkota in kab_candidates:
+                kec_candidates = admin_candidates(kec_table, row["Kecamatan SPPG"], kabkota.geometry)
+                if not kec_candidates:
+                    results.append(AdminPathResult(province=province, kabkota=kabkota))
+                    continue
+
+                for kecamatan in kec_candidates:
+                    kel_candidates: list[BoundaryCandidate] = []
+                    for kel_table in kel_tables:
+                        kel_candidates.extend(admin_candidates(kel_table, row["Kelurahan/Desa SPPG"], kecamatan.geometry))
+
+                    if kel_candidates:
+                        for kelurahan in kel_candidates:
+                            results.append(
+                                AdminPathResult(
+                                    province=province,
+                                    kabkota=kabkota,
+                                    kecamatan=kecamatan,
+                                    kelurahan=kelurahan,
+                                )
+                            )
+                    else:
+                        results.append(
+                            AdminPathResult(
+                                province=province,
+                                kabkota=kabkota,
+                                kecamatan=kecamatan,
+                            )
+                        )
 
     results.sort(
         key=lambda path: (
@@ -757,8 +938,16 @@ def resolve_admin_paths(extract: PreparedExtract, row: pd.Series) -> list[AdminP
     return results
 
 
-def geocode_row(extract: PreparedExtract, row: pd.Series) -> dict[str, object]:
-    path_candidates = resolve_admin_paths(extract, row)
+def geocode_row(
+    extract: PreparedExtract,
+    row: pd.Series | dict[str, object],
+    admin_path: AdminPathResult | None = None,
+    city_boundary: BaseGeometry | None = None,
+) -> dict[str, object]:
+    if admin_path is not None:
+        path_candidates = [admin_path]
+    else:
+        path_candidates = resolve_admin_paths(extract, row, city_boundary=city_boundary)
     if not path_candidates:
         return {
             "latitude": None,
@@ -805,6 +994,111 @@ def geocode_row(extract: PreparedExtract, row: pd.Series) -> dict[str, object]:
     }
 
 
+def output_sheet_columns() -> list[str]:
+    address_index = INPUT_COLUMNS.index("Alamat SPPG")
+    return INPUT_COLUMNS[:address_index] + ["latitude", "longitude"] + INPUT_COLUMNS[address_index:]
+
+
+def unresolved_sheet_headers() -> list[str]:
+    return [
+        "source_excel_row",
+        "No",
+        "Provinsi SPPG",
+        "Kab./Kota SPPG",
+        "Kecamatan SPPG",
+        "Kelurahan/Desa SPPG",
+        "Alamat SPPG",
+        "Nama SPPG",
+        "status",
+        "reason",
+        "admin_level_used",
+        "candidate_phrase",
+        "matched_road_name",
+        "match_score",
+        "candidate_count",
+    ]
+
+
+def output_row_values(row: dict[str, object], result: dict[str, object] | None = None) -> list[object]:
+    latitude = None if result is None else result["latitude"]
+    longitude = None if result is None else result["longitude"]
+    return [
+        row["No"],
+        row["Provinsi SPPG"],
+        row["Kab./Kota SPPG"],
+        row["Kecamatan SPPG"],
+        row["Kelurahan/Desa SPPG"],
+        latitude,
+        longitude,
+        row["Alamat SPPG"],
+        row["Nama SPPG"],
+    ]
+
+
+def unresolved_row_values(row: dict[str, object], result: dict[str, object]) -> list[object]:
+    return [
+        row["source_excel_row"],
+        row["No"],
+        row["Provinsi SPPG"],
+        row["Kab./Kota SPPG"],
+        row["Kecamatan SPPG"],
+        row["Kelurahan/Desa SPPG"],
+        row["Alamat SPPG"],
+        row["Nama SPPG"],
+        result["status"],
+        result["reason"],
+        result["admin_level_used"],
+        result["candidate_phrase"],
+        result["matched_road_name"],
+        result["match_score"],
+        result["candidate_count"],
+    ]
+
+
+def create_output_workbook(rows: pd.DataFrame, sheet_name: str) -> tuple[Workbook, object, object, dict[int, int]]:
+    workbook = Workbook()
+    ws = workbook.active
+    ws.title = sheet_name
+    review_ws = workbook.create_sheet("unresolved_rows")
+
+    ws.append(output_sheet_columns())
+    review_ws.append(unresolved_sheet_headers())
+    ws.column_dimensions["F"].width = 12
+    ws.column_dimensions["G"].width = 12
+
+    row_map: dict[int, int] = {}
+    for output_row_num, row in enumerate(rows.to_dict(orient="records"), start=2):
+        source_excel_row = int(row["source_excel_row"])
+        row_map[source_excel_row] = output_row_num
+        ws.append(output_row_values(row))
+
+    return workbook, ws, review_ws, row_map
+
+
+def apply_results_to_workbook(
+    ws,
+    review_ws,
+    rows: pd.DataFrame,
+    results: list[dict[str, object]],
+    row_map: dict[int, int],
+) -> None:
+    row_records = rows.to_dict(orient="records")
+    if len(row_records) != len(results):
+        raise ValueError(f"Row/result mismatch: {len(row_records)} rows vs {len(results)} results")
+
+    for row, result in zip(row_records, results):
+        output_row_num = row_map[int(row["source_excel_row"])]
+        ws.cell(row=output_row_num, column=6, value=result["latitude"])
+        ws.cell(row=output_row_num, column=7, value=result["longitude"])
+        if result["status"] != "matched":
+            review_ws.append(unresolved_row_values(row, result))
+
+
+def save_output_workbook(workbook: Workbook, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(output_path)
+
+
 def load_input_rows(workbook_path: Path) -> tuple[str, pd.DataFrame]:
     wb = load_workbook(workbook_path, read_only=True, data_only=True)
     try:
@@ -826,80 +1120,9 @@ def write_output_workbook(
     output_path: Path,
     sheet_name: str,
 ) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    workbook = Workbook()
-    ws = workbook.active
-    ws.title = sheet_name
-
-    address_index = INPUT_COLUMNS.index("Alamat SPPG")
-    output_columns = INPUT_COLUMNS[:address_index] + ["latitude", "longitude"] + INPUT_COLUMNS[address_index:]
-    ws.append(output_columns)
-    ws.column_dimensions["F"].width = 12
-    ws.column_dimensions["G"].width = 12
-
-    for row, result in zip(rows.to_dict(orient="records"), results):
-        ws.append(
-            [
-                row["No"],
-                row["Provinsi SPPG"],
-                row["Kab./Kota SPPG"],
-                row["Kecamatan SPPG"],
-                row["Kelurahan/Desa SPPG"],
-                result["latitude"],
-                result["longitude"],
-                row["Alamat SPPG"],
-                row["Nama SPPG"],
-            ]
-        )
-
-    unresolved_sheet_name = "unresolved_rows"
-    review_ws = workbook.create_sheet(unresolved_sheet_name)
-
-    review_headers = [
-        "source_excel_row",
-        "No",
-        "Provinsi SPPG",
-        "Kab./Kota SPPG",
-        "Kecamatan SPPG",
-        "Kelurahan/Desa SPPG",
-        "Alamat SPPG",
-        "Nama SPPG",
-        "status",
-        "reason",
-        "admin_level_used",
-        "candidate_phrase",
-        "matched_road_name",
-        "match_score",
-        "candidate_count",
-    ]
-    review_ws.append(review_headers)
-
-    for idx, result in enumerate(results, start=2):
-        if result["status"] == "matched":
-            continue
-        source = result["source_row"]
-        review_ws.append(
-            [
-                source["source_excel_row"],
-                source["No"],
-                source["Provinsi SPPG"],
-                source["Kab./Kota SPPG"],
-                source["Kecamatan SPPG"],
-                source["Kelurahan/Desa SPPG"],
-                source["Alamat SPPG"],
-                source["Nama SPPG"],
-                result["status"],
-                result["reason"],
-                result["admin_level_used"],
-                result["candidate_phrase"],
-                result["matched_road_name"],
-                result["match_score"],
-                result["candidate_count"],
-            ]
-        )
-
-    workbook.save(output_path)
+    workbook, ws, review_ws, row_map = create_output_workbook(rows, sheet_name)
+    apply_results_to_workbook(ws, review_ws, rows, results, row_map)
+    save_output_workbook(workbook, output_path)
 
 
 def default_output_path(group: str | None) -> Path:
@@ -925,6 +1148,154 @@ def add_source_row_refs(rows: pd.DataFrame) -> pd.DataFrame:
     enriched = rows.copy()
     enriched["source_row"] = enriched.to_dict(orient="records")
     return enriched
+
+
+def java_row_keys(row: pd.Series | dict[str, object]) -> tuple[str, str, str, str]:
+    province_key = normalize_admin_name(row["Provinsi SPPG"])
+    kabkota_key = normalize_kabkota_name(row["Kab./Kota SPPG"])
+    kecamatan_key = normalize_admin_name(row["Kecamatan SPPG"])
+    kelurahan_key = normalize_admin_name(row["Kelurahan/Desa SPPG"])
+    return province_key, kabkota_key, kecamatan_key, kelurahan_key
+
+
+def java_job_key(row: pd.Series | dict[str, object]) -> tuple[str, str, str]:
+    province_key, kabkota_key, kecamatan_key, _ = java_row_keys(row)
+    return province_key, kabkota_key, kecamatan_key
+
+
+def _make_boundary_candidate(
+    level: int,
+    name_raw: str,
+    name_norm: str,
+    geometry: BaseGeometry,
+) -> BoundaryCandidate:
+    return BoundaryCandidate(
+        level=level,
+        source_index=-1,
+        name_raw=name_raw,
+        name_norm=name_norm,
+        geometry=geometry,
+        score=1.0,
+    )
+
+
+def build_java_admin_path(
+    row: pd.Series | dict[str, object],
+    catalog: JavaAdminCatalog,
+    group_geometry: BaseGeometry,
+) -> AdminPathResult:
+    province_key, kabkota_key, kecamatan_key, kelurahan_key = java_row_keys(row)
+    province_raw = str(row["Provinsi SPPG"])
+    kabkota_raw = str(row["Kab./Kota SPPG"])
+    kecamatan_raw = str(row["Kecamatan SPPG"])
+    kelurahan_raw = str(row["Kelurahan/Desa SPPG"])
+
+    kec_bounds = catalog.kecamatan_bounds.get((province_key, kabkota_key, kecamatan_key))
+    if kec_bounds is not None:
+        geometry = box(*kec_bounds)
+        province = _make_boundary_candidate(4, province_raw, province_key, geometry)
+        kabkota = _make_boundary_candidate(5, kabkota_raw, kabkota_key, geometry)
+        kecamatan = _make_boundary_candidate(6, kecamatan_raw, kecamatan_key, geometry)
+        kelurahan = _make_boundary_candidate(7, kelurahan_raw, kelurahan_key, geometry)
+        return AdminPathResult(province=province, kabkota=kabkota, kecamatan=kecamatan, kelurahan=kelurahan)
+
+    province = _make_boundary_candidate(4, province_raw, province_key, group_geometry)
+    kabkota = _make_boundary_candidate(5, kabkota_raw, kabkota_key, group_geometry)
+    kecamatan = _make_boundary_candidate(6, kecamatan_raw, kecamatan_key, group_geometry)
+    kelurahan = _make_boundary_candidate(7, kelurahan_raw, kelurahan_key, group_geometry)
+    return AdminPathResult(province=province, kabkota=kabkota, kecamatan=kecamatan, kelurahan=kelurahan)
+
+
+def java_group_geometry(
+    catalog: JavaAdminCatalog,
+    row: pd.Series | dict[str, object],
+) -> BaseGeometry | None:
+    province_key, kabkota_key, kecamatan_key, _ = java_row_keys(row)
+    key = (province_key, kabkota_key, kecamatan_key)
+    bounds = catalog.kecamatan_bounds.get(key)
+    if bounds is not None:
+        return box(*bounds)
+
+    bounds = catalog.kabkota_bounds.get((province_key, kabkota_key))
+    if bounds is not None:
+        return box(*bounds)
+
+    bounds = catalog.province_bounds.get(province_key)
+    if bounds is not None:
+        return box(*bounds)
+    return None
+
+
+def java_job_geometry(
+    catalog: JavaAdminCatalog,
+    job_key: tuple[str, str, str],
+) -> BaseGeometry | None:
+    province_key, kabkota_key, kecamatan_key = job_key
+    bounds = catalog.kecamatan_bounds.get(job_key)
+    if bounds is not None:
+        return box(*bounds)
+
+    bounds = catalog.kabkota_bounds.get((province_key, kabkota_key))
+    if bounds is not None:
+        return box(*bounds)
+
+    bounds = catalog.province_bounds.get(province_key)
+    if bounds is not None:
+        return box(*bounds)
+    return None
+
+
+def process_java_rows(df: pd.DataFrame, args: argparse.Namespace, sheet_name: str) -> None:
+    catalog = build_java_admin_catalog()
+    java_pbf = extract_path_for_group("java")
+
+    work_df = df.copy()
+    work_df["java_job_key"] = [java_job_key(row) for row in work_df.to_dict(orient="records")]
+
+    workbook, ws, review_ws, row_map = create_output_workbook(work_df, sheet_name)
+    save_output_workbook(workbook, args.output)
+    print(f"[group] initialized output workbook at {args.output.name}")
+    matched_total = 0
+    unresolved_total = 0
+    processed_total = 0
+
+    job_order = list(dict.fromkeys(work_df["java_job_key"].tolist()))
+    for job_key in job_order:
+        job_rows = work_df.loc[work_df["java_job_key"] == job_key].copy()
+        job_geometry = java_job_geometry(catalog, job_key)
+        if job_geometry is None:
+            raise ValueError(f"Could not resolve a Java geometry for group {job_key}")
+
+        bbox = list(job_geometry.bounds)
+        province_key, kabkota_key, kecamatan_key = job_key
+        print(f"[group] {province_key} / {kabkota_key} / {kecamatan_key} rows={len(job_rows)} bbox={bbox}")
+        print(f"[extract] building {java_pbf.name} for {province_key} / {kabkota_key} / {kecamatan_key}")
+
+        extract = build_extract(java_pbf, bounding_box=bbox, include_boundaries=False)
+        group_results = []
+        for row in job_rows.to_dict(orient="records"):
+            admin_path = build_java_admin_path(row, catalog, job_geometry)
+            group_results.append(geocode_row(extract, row, admin_path=admin_path))
+
+        apply_results_to_workbook(ws, review_ws, job_rows, group_results, row_map)
+
+        group_matched = sum(1 for item in group_results if item["status"] == "matched")
+        group_unresolved = len(group_results) - group_matched
+        matched_total += group_matched
+        unresolved_total += group_unresolved
+        processed_total += len(group_results)
+
+        save_output_workbook(workbook, args.output)
+        print(
+            f"[group] saved {args.output.name} after {province_key} / {kabkota_key} / {kecamatan_key}: "
+            f"processed={processed_total}/{len(work_df)} matched={matched_total} unresolved={unresolved_total}"
+        )
+
+        del extract
+        gc.collect()
+
+    print(f"[done] matched={matched_total} unresolved={unresolved_total}")
+    print(f"[done] wrote {args.output.resolve()}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -975,9 +1346,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.output is None:
         args.output = default_output_path(args.group)
 
-    df["source_row"] = df.to_dict(orient="records")
+    if args.group == "java":
+        process_java_rows(df, args, sheet_name)
+        return
 
-    unique_groups = [args.group] if args.group is not None else [group for group in df["extract_group"].dropna().unique().tolist()]
+    unique_groups = [group for group in df["extract_group"].dropna().unique().tolist()]
     prepared_extracts: dict[str, PreparedExtract] = {}
     for group in unique_groups:
         pbf_path = extract_path_for_group(group)
@@ -989,7 +1362,6 @@ def main(argv: list[str] | None = None) -> None:
         group = row["extract_group"]
         extract = prepared_extracts[group]
         geocode_result = geocode_row(extract, row)
-        geocode_result["source_row"] = row["source_row"]
         results.append(geocode_result)
         if (idx + 1) % 500 == 0 or idx + 1 == total:
             matched = sum(1 for item in results if item["status"] == "matched")
