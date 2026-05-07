@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../../ClimateData/OSM_roads"
+		}
+	],
+	"settings": {}
+}
